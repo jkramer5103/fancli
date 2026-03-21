@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""fancli — fan control CLI for Gigabyte G5 GE."""
+
+import json
+import os
+import sys
+import time
+import argparse
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+STATUS_PATH   = '/run/g5ge-fan/status.json'
+OVERRIDE_PATH = '/run/g5ge-fan/override.json'
+CONFIG_PATH   = '/etc/g5ge-fan/config.json'
+RUN_DIR       = '/run/g5ge-fan'
+DEFAULT_CURVE = [[0, 10], [50, 30], [65, 60], [75, 80], [85, 100]]
+STALE_THRESHOLD = 10  # seconds
+
+# ─── ANSI ─────────────────────────────────────────────────────────────────────
+
+RESET  = '\033[0m'
+BOLD   = '\033[1m'
+GREEN  = '\033[32m'
+YELLOW = '\033[33m'
+RED    = '\033[31m'
+CYAN   = '\033[36m'
+
+
+def color_for_temp(temp):
+    """Return ANSI color code for a temperature value."""
+    if temp <= 59:
+        return GREEN
+    elif temp <= 75:
+        return YELLOW
+    else:
+        return RED
+
+
+def format_bar(pct, width=20):
+    """Return a colored ASCII progress bar string of fixed width."""
+    filled = round(pct * width / 100)
+    filled = max(0, min(width, filled))
+    bar = '█' * filled + '░' * (width - filled)
+    return f"{CYAN}{bar}{RESET}"
+
+
+# ─── IPC Helpers ──────────────────────────────────────────────────────────────
+
+def is_stale(timestamp):
+    """Return True if timestamp is more than STALE_THRESHOLD seconds old."""
+    return (time.time() - timestamp) > STALE_THRESHOLD
+
+
+def read_status(path=None):
+    """Read status.json. Returns dict or None."""
+    if path is None:
+        path = STATUS_PATH
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, Exception):
+        return None
+
+
+def write_override(data):
+    """Atomically write override.json."""
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    tmp = OVERRIDE_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.rename(tmp, OVERRIDE_PATH)
+
+
+def load_config_file(path):
+    """Load a config/override JSON file. Returns dict or None."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if 'mode' not in data:
+            return None
+        return data
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, Exception):
+        return None
+
+
+# ─── Status Display ───────────────────────────────────────────────────────────
+
+def render_status(status):
+    """Render the status box to a list of lines."""
+    mode_str  = status['mode'].upper()
+    cpu_temp  = status.get('cpu_temp', 0)
+    gpu_temp  = status.get('gpu_temp', 0)
+    gpu_ok    = status.get('gpu_sensor_ok', True)
+    speed_pct = status.get('speed_pct', 0)
+
+    cpu_color = color_for_temp(cpu_temp)
+    gpu_color = color_for_temp(gpu_temp)
+    gpu_suffix = f"  {RED}(sensor error){RESET}" if not gpu_ok else ""
+    bar = format_bar(speed_pct)
+
+    # Fixed-width box — 36 chars wide interior
+    W = 36
+    def row(content):
+        # content may contain ANSI codes; pad to visible width W
+        import re
+        visible = re.sub(r'\033\[[^m]*m', '', content)
+        pad = W - len(visible)
+        return f"║{content}{' ' * max(0, pad)}║"
+
+    lines = [
+        "╔" + "═" * W + "╗",
+        row("       G5 GE Fan Control         "),
+        "╠" + "═" * W + "╣",
+        row(f"  Mode:      {BOLD}{mode_str}{RESET}"),
+        row(f"  CPU Temp:  {cpu_color}{cpu_temp}°C{RESET}"),
+        row(f"  GPU Temp:  {gpu_color}{gpu_temp}°C{RESET}{gpu_suffix}"),
+        row(f"  Fan Speed: {speed_pct}%  {bar}"),
+        "╚" + "═" * W + "╝",
+    ]
+    return lines
+
+
+def cmd_status(args):
+    """Print fan status dashboard."""
+    status = read_status()
+    if status is None:
+        print("Daemon not running (no status file found).")
+        sys.exit(1)
+    lines = render_status(status)
+    print('\n'.join(lines))
+    if is_stale(status.get('timestamp', 0)):
+        print(f"{RED}[DAEMON NOT RUNNING — stale data]{RESET}")
+
+
+# ─── set / auto ───────────────────────────────────────────────────────────────
+
+def cmd_set(args):
+    """Set manual fan speed override."""
+    pct = args.percent
+    if not (0 <= pct <= 100):
+        print(f"Error: percent must be 0-100, got {pct}", file=sys.stderr)
+        sys.exit(1)
+    write_override({'mode': 'manual', 'speed': pct})
+    print(f"Override set: manual at {pct}%")
+
+
+def cmd_auto(args):
+    """Clear manual override."""
+    try:
+        os.remove(OVERRIDE_PATH)
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        print("Error: permission denied. Run as root.", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print("Override cleared. Daemon will follow /etc/g5ge-fan/config.json.")
+
+
+# ─── curve ────────────────────────────────────────────────────────────────────
+
+def get_active_curve_info():
+    """Return (curve, manual_speed_or_None, note_str) per spec 4-step logic."""
+    override = load_config_file(OVERRIDE_PATH)
+    if override is not None:
+        if override.get('mode') == 'auto':
+            return override.get('curve', DEFAULT_CURVE), None, ''
+        if override.get('mode') == 'manual' and 'speed' in override:
+            cfg = load_config_file(CONFIG_PATH)
+            if cfg and cfg.get('mode') == 'auto':
+                curve = cfg.get('curve', DEFAULT_CURVE)
+            else:
+                curve = DEFAULT_CURVE
+            spd = override['speed']
+            return curve, spd, f"[Manual at {spd}% — background curve from config]"
+        # malformed or manual without speed: fall through
+
+    cfg = load_config_file(CONFIG_PATH)
+    if cfg is not None:
+        if cfg.get('mode') == 'auto':
+            return cfg.get('curve', DEFAULT_CURVE), None, ''
+        if cfg.get('mode') == 'manual' and 'speed' in cfg:
+            spd = cfg['speed']
+            return cfg.get('curve', DEFAULT_CURVE), spd, f"[Manual at {spd}% — background curve from config]"
+
+    return DEFAULT_CURVE, None, '(using default curve — config.json missing or unreadable)'
+
+
+def render_curve_chart(curve, manual_speed=None, width=60, height=20):
+    """Render an ASCII chart of the fan curve. Returns list of lines."""
+    temp_min   = curve[0][0]
+    temp_max   = curve[-1][0]
+    temp_range = temp_max - temp_min or 1
+
+    def interp(t):
+        if t <= curve[0][0]:
+            return curve[0][1]
+        if t >= curve[-1][0]:
+            return curve[-1][1]
+        for i in range(len(curve) - 1):
+            t0, s0 = curve[i]
+            t1, s1 = curve[i + 1]
+            if t0 <= t <= t1:
+                return s0 + (t - t0) / (t1 - t0) * (s1 - s0)
+        return curve[-1][1]
+
+    def speed_to_y(s):
+        return height - 1 - round(s / 100 * (height - 1))
+
+    grid = [[' '] * width for _ in range(height)]
+
+    for i in range(width):
+        t = temp_min + i / max(width - 1, 1) * temp_range
+        s = interp(t)
+        y = speed_to_y(s)
+        if 0 <= y < height:
+            grid[y][i] = f"{CYAN}*{RESET}"
+
+    if manual_speed is not None:
+        y = speed_to_y(manual_speed)
+        if 0 <= y < height:
+            for i in range(width):
+                if grid[y][i] == ' ':
+                    grid[y][i] = f"{YELLOW}-{RESET}"
+
+    lines = [f"  Fan Speed % vs Temperature °C", f"  Points: {curve}", ""]
+    for row_idx, row in enumerate(grid):
+        speed_label = round(100 - row_idx / (height - 1) * 100)
+        lines.append(f"{speed_label:3d}% |" + ''.join(row))
+    lines.append("     +" + "─" * width)
+
+    # X-axis labels
+    n_labels = 6
+    label_line = "      "
+    for i in range(n_labels):
+        t = temp_min + i * temp_range // max(n_labels - 1, 1)
+        label_line += f"{t:<10}"
+    lines.append(label_line)
+    lines.append(f"      Temperature °C  ({temp_min}–{temp_max}°C)")
+    return lines
+
+
+def cmd_curve(args):
+    """Display ASCII fan curve chart."""
+    curve, manual_speed, note = get_active_curve_info()
+    if note:
+        print(note)
+    print('\n'.join(render_curve_chart(curve, manual_speed)))
+
+
+# ─── watch ────────────────────────────────────────────────────────────────────
+
+def cmd_watch(args):
+    """Live-updating status, refreshes every 2 seconds."""
+    sys.stdout.write('\033[?25l')
+    sys.stdout.flush()
+    try:
+        while True:
+            status = read_status()
+            sys.stdout.write('\033[2J\033[H')
+            sys.stdout.flush()
+            if status is None:
+                print("Daemon not running (no status file found).")
+            else:
+                print('\n'.join(render_status(status)))
+                if is_stale(status.get('timestamp', 0)):
+                    print(f"{RED}[DAEMON NOT RUNNING — stale data]{RESET}")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        sys.stdout.write('\033[?25h')
+        sys.stdout.flush()
+        print("Stopped.")
+    except Exception:
+        sys.stdout.write('\033[?25h')
+        sys.stdout.flush()
+        raise
+
+
+# ─── main ─────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(prog='fancli', description='G5 GE fan control')
+    sub = parser.add_subparsers(dest='command')
+
+    sub.add_parser('status', help='Show fan status dashboard')
+    p_set = sub.add_parser('set', help='Set manual fan speed (0-100)')
+    p_set.add_argument('percent', type=int, help='Fan speed 0-100')
+    sub.add_parser('auto',  help='Clear manual override')
+    sub.add_parser('curve', help='Show fan curve ASCII chart')
+    sub.add_parser('watch', help='Live-updating status (Ctrl+C to exit)')
+
+    args = parser.parse_args()
+
+    dispatch = {
+        'status': cmd_status,
+        'set':    cmd_set,
+        'auto':   cmd_auto,
+        'curve':  cmd_curve,
+        'watch':  cmd_watch,
+    }
+    fn = dispatch.get(args.command)
+    if fn:
+        fn(args)
+    else:
+        parser.print_help()
+        sys.exit(1)

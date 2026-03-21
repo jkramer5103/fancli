@@ -1,0 +1,15 @@
+[Unit]
+Description=G5 GE Fan Control Daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/g5ge-fandaemon.py
+Restart=always
+RestartSec=5
+RuntimeDirectory=g5ge-fan
+RuntimeDirectoryMode=0755
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
