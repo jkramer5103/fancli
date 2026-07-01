@@ -35,6 +35,10 @@ sudo fancli max-stop
 
 `set` writes a temporary manual override under `/run/g5ge-fan`. `auto` clears the override and returns to the configured fan curve. `max` stops the daemon and keeps the fan at full speed until `max-stop` restarts automatic control.
 
+## Modes
+
+The different modes are built janky af and vibecoded, but they work. I might clean this up later, and I am very open to PRs.
+
 ## Configuration
 
 Default config path:
