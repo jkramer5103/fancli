@@ -14,7 +14,7 @@ DEFAULT_CURVE = [[0, 10], [50, 30], [65, 60], [75, 80], [85, 100]]
 CONFIG_PATH = '/etc/g5ge-fan/config.json'
 OVERRIDE_PATH = '/run/g5ge-fan/override.json'
 STATUS_PATH = '/run/g5ge-fan/status.json'
-CYCLE_SECONDS = 3
+CYCLE_SECONDS = 2
 
 
 def interpolate_curve(curve, temp):
@@ -107,13 +107,13 @@ def read_gpu_with_fallback(state):
 
 
 def send_fan_speeds(cpu_raw, gpu_raw):
-    """Send outb commands to set CPU and GPU fan speeds via EC."""
+    """Send outb commands to set fan speed via EC.
+    Register 0x01 controls the fan (GPU follows CPU on this platform).
+    """
     sequence = [
         ['outb', '0x66', '0x99'],        # unlock EC
-        ['outb', '0x62', '0x01'],         # select CPU fan register
-        ['outb', '0x62', str(cpu_raw)],   # write CPU speed
-        ['outb', '0x62', '0x02'],         # select GPU fan register
-        ['outb', '0x62', str(gpu_raw)],   # write GPU speed
+        ['outb', '0x62', '0x01'],         # select fan register
+        ['outb', '0x62', f'0x{cpu_raw:02X}'],  # write speed
     ]
     for cmd in sequence:
         subprocess.run(cmd, check=True)

@@ -3,9 +3,13 @@
 
 import json
 import os
+import re
+import signal
+import subprocess
 import sys
 import time
 import argparse
+import glob as globmod
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -13,8 +17,10 @@ STATUS_PATH   = '/run/g5ge-fan/status.json'
 OVERRIDE_PATH = '/run/g5ge-fan/override.json'
 CONFIG_PATH   = '/etc/g5ge-fan/config.json'
 RUN_DIR       = '/run/g5ge-fan'
+PID_FILE      = '/run/g5ge-fan/max.pid'
 DEFAULT_CURVE = [[0, 10], [50, 30], [65, 60], [75, 80], [85, 100]]
 STALE_THRESHOLD = 10  # seconds
+SERVICE_NAME  = 'g5ge-fancontrol'
 
 # ─── ANSI ─────────────────────────────────────────────────────────────────────
 
@@ -24,6 +30,7 @@ GREEN  = '\033[32m'
 YELLOW = '\033[33m'
 RED    = '\033[31m'
 CYAN   = '\033[36m'
+MAGENTA = '\033[35m'
 
 
 def color_for_temp(temp):
@@ -44,6 +51,68 @@ def format_bar(pct, width=20):
     return f"{CYAN}{bar}{RESET}"
 
 
+# ─── Max mode helpers ────────────────────────────────────────────────────────
+
+def is_max_running():
+    """Check if a max fan process is running."""
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)  # check if alive
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
+        return False
+
+
+def stop_max():
+    """Stop a running background max process if any. Returns True if stopped."""
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        os.remove(PID_FILE)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
+        return False
+
+
+def _ensure_daemon_running():
+    """Start the fan control daemon if not running."""
+    subprocess.run(['systemctl', 'start', SERVICE_NAME], check=False)
+
+
+def _ensure_daemon_stopped():
+    """Stop the fan control daemon."""
+    subprocess.run(['systemctl', 'stop', SERVICE_NAME], check=False)
+
+
+def _read_cpu_temp():
+    """Return max CPU temp in °C, or None."""
+    paths = globmod.glob('/sys/class/thermal/thermal_zone*/temp')
+    temps = []
+    for p in paths:
+        try:
+            with open(p) as f:
+                temps.append(int(f.read().strip()) / 1000.0)
+        except (OSError, ValueError):
+            continue
+    return round(max(temps)) if temps else None
+
+
+def _read_gpu_temp():
+    """Return GPU temp as int, or None."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
+
 # ─── IPC Helpers ──────────────────────────────────────────────────────────────
 
 def is_stale(timestamp):
@@ -58,10 +127,28 @@ def read_status(path=None):
     try:
         with open(path) as f:
             return json.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
         return None
-    except (json.JSONDecodeError, Exception):
-        return None
+
+
+def write_status(mode, speed_pct, cpu_temp, gpu_temp):
+    """Write status.json."""
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    data = {
+        'mode': mode,
+        'speed_pct': round(speed_pct),
+        'cpu_temp': cpu_temp if cpu_temp is not None else 0,
+        'gpu_temp': gpu_temp if gpu_temp is not None else 0,
+        'gpu_sensor_ok': gpu_temp is not None,
+        'timestamp': time.time(),
+    }
+    tmp = STATUS_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, STATUS_PATH)
+    os.chmod(STATUS_PATH, 0o644)
 
 
 def write_override(data):
@@ -81,9 +168,7 @@ def load_config_file(path):
         if 'mode' not in data:
             return None
         return data
-    except FileNotFoundError:
-        return None
-    except (json.JSONDecodeError, Exception):
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
         return None
 
 
@@ -97,6 +182,14 @@ def render_status(status):
     gpu_ok    = status.get('gpu_sensor_ok', True)
     speed_pct = status.get('speed_pct', 0)
 
+    # Color the mode label
+    if mode_str == 'MAX':
+        mode_display = f"{RED}{BOLD}{mode_str}{RESET}"
+    elif mode_str == 'MANUAL':
+        mode_display = f"{YELLOW}{BOLD}{mode_str}{RESET}"
+    else:
+        mode_display = f"{GREEN}{BOLD}{mode_str}{RESET}"
+
     cpu_color = color_for_temp(cpu_temp)
     gpu_color = color_for_temp(gpu_temp)
     gpu_suffix = f"  {RED}(sensor error){RESET}" if not gpu_ok else ""
@@ -105,8 +198,6 @@ def render_status(status):
     # Fixed-width box — 36 chars wide interior
     W = 36
     def row(content):
-        # content may contain ANSI codes; pad to visible width W
-        import re
         visible = re.sub(r'\033\[[^m]*m', '', content)
         pad = W - len(visible)
         return f"║{content}{' ' * max(0, pad)}║"
@@ -115,7 +206,7 @@ def render_status(status):
         "╔" + "═" * W + "╗",
         row("       G5 GE Fan Control         "),
         "╠" + "═" * W + "╣",
-        row(f"  Mode:      {BOLD}{mode_str}{RESET}"),
+        row(f"  Mode:      {mode_display}"),
         row(f"  CPU Temp:  {cpu_color}{cpu_temp}°C{RESET}"),
         row(f"  GPU Temp:  {gpu_color}{gpu_temp}°C{RESET}{gpu_suffix}"),
         row(f"  Fan Speed: {speed_pct}%  {bar}"),
@@ -128,11 +219,14 @@ def cmd_status(args):
     """Print fan status dashboard."""
     status = read_status()
     if status is None:
-        print("Daemon not running (no status file found).")
+        if is_max_running():
+            print(f"{RED}{BOLD}MAX{RESET} mode active (no status data yet)")
+        else:
+            print("Daemon not running (no status file found).")
         sys.exit(1)
     lines = render_status(status)
     print('\n'.join(lines))
-    if is_stale(status.get('timestamp', 0)):
+    if status['mode'] != 'max' and is_stale(status.get('timestamp', 0)):
         print(f"{RED}[DAEMON NOT RUNNING — stale data]{RESET}")
 
 
@@ -144,12 +238,20 @@ def cmd_set(args):
     if not (0 <= pct <= 100):
         print(f"Error: percent must be 0-100, got {pct}", file=sys.stderr)
         sys.exit(1)
+    # Stop max mode if active
+    if stop_max():
+        print("Stopped max mode.")
+        _ensure_daemon_running()
     write_override({'mode': 'manual', 'speed': pct})
     print(f"Override set: manual at {pct}%")
 
 
 def cmd_auto(args):
     """Clear manual override."""
+    # Stop max mode if active
+    if stop_max():
+        print("Stopped max mode.")
+        _ensure_daemon_running()
     try:
         os.remove(OVERRIDE_PATH)
     except FileNotFoundError:
@@ -179,7 +281,6 @@ def get_active_curve_info():
                 curve = DEFAULT_CURVE
             spd = override['speed']
             return curve, spd, f"[Manual at {spd}% — background curve from config]"
-        # malformed or manual without speed: fall through
 
     cfg = load_config_file(CONFIG_PATH)
     if cfg is not None:
@@ -235,7 +336,6 @@ def render_curve_chart(curve, manual_speed=None, width=60, height=20):
         lines.append(f"{speed_label:3d}% |" + ''.join(row))
     lines.append("     +" + "─" * width)
 
-    # X-axis labels
     n_labels = 6
     label_line = "      "
     for i in range(n_labels):
@@ -248,6 +348,9 @@ def render_curve_chart(curve, manual_speed=None, width=60, height=20):
 
 def cmd_curve(args):
     """Display ASCII fan curve chart."""
+    if is_max_running():
+        print(f"{RED}{BOLD}MAX mode active{RESET} — fan curve not in use")
+        print()
     curve, manual_speed, note = get_active_curve_info()
     if note:
         print(note)
@@ -266,10 +369,13 @@ def cmd_watch(args):
             sys.stdout.write('\033[2J\033[H')
             sys.stdout.flush()
             if status is None:
-                print("Daemon not running (no status file found).")
+                if is_max_running():
+                    print(f"{RED}{BOLD}MAX{RESET} mode active (no status data yet)")
+                else:
+                    print("Daemon not running (no status file found).")
             else:
                 print('\n'.join(render_status(status)))
-                if is_stale(status.get('timestamp', 0)):
+                if status['mode'] != 'max' and is_stale(status.get('timestamp', 0)):
                     print(f"{RED}[DAEMON NOT RUNNING — stale data]{RESET}")
             time.sleep(2)
     except KeyboardInterrupt:
@@ -282,27 +388,110 @@ def cmd_watch(args):
         raise
 
 
+# ─── max ──────────────────────────────────────────────────────────────────────
+
+def _fan_max_loop():
+    """Background loop: send max fan speed every 2 seconds, write status."""
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+    def handle_sigterm(signum, frame):
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    try:
+        while True:
+            subprocess.run(['outb', '0x66', '0x99'], check=True)
+            subprocess.run(['outb', '0x62', '0x01'], check=True)
+            subprocess.run(['outb', '0x62', '0xFF'], check=True)
+
+            # Write status so fancli status/watch can show MAX mode
+            cpu_temp = _read_cpu_temp()
+            gpu_temp = _read_gpu_temp()
+            write_status('max', 100, cpu_temp, gpu_temp)
+
+            time.sleep(2)
+    finally:
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+
+def cmd_max(args):
+    """Run fans at maximum speed in the background."""
+    if os.geteuid() != 0:
+        print("Error: 'fancli max' must run as root (use sudo).", file=sys.stderr)
+        sys.exit(1)
+
+    # Stop any existing max process and the daemon
+    stop_max()
+    _ensure_daemon_stopped()
+
+    pid = os.fork()
+    if pid > 0:
+        # Parent
+        print(f"Fan max started (pid {pid}). Use 'sudo fancli max-stop' to stop.")
+        return
+
+    # Child: detach and run
+    os.setsid()
+    sys.stdin.close()
+    devnull = open(os.devnull, 'w')
+    sys.stdout = devnull
+    sys.stderr = devnull
+    try:
+        _fan_max_loop()
+    except Exception:
+        pass
+    finally:
+        sys.exit(0)
+
+
+def cmd_max_stop(args):
+    """Stop background max fan process and restart daemon."""
+    if os.geteuid() != 0:
+        print("Error: must run as root (use sudo).", file=sys.stderr)
+        sys.exit(1)
+    if stop_max():
+        print("Fan max stopped.")
+    else:
+        print("No fan max process running.")
+    _ensure_daemon_running()
+    print("Daemon restarted.")
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='fancli', description='G5 GE fan control')
     sub = parser.add_subparsers(dest='command')
 
-    sub.add_parser('status', help='Show fan status dashboard')
+    sub.add_parser('status',   help='Show fan status dashboard')
     p_set = sub.add_parser('set', help='Set manual fan speed (0-100)')
     p_set.add_argument('percent', type=int, help='Fan speed 0-100')
-    sub.add_parser('auto',  help='Clear manual override')
-    sub.add_parser('curve', help='Show fan curve ASCII chart')
-    sub.add_parser('watch', help='Live-updating status (Ctrl+C to exit)')
+    sub.add_parser('auto',     help='Clear manual override')
+    sub.add_parser('curve',    help='Show fan curve ASCII chart')
+    sub.add_parser('watch',    help='Live-updating status (Ctrl+C to exit)')
+    sub.add_parser('max',      help='Run fans at max speed (requires sudo)')
+    sub.add_parser('max-stop', help='Stop max mode, restart daemon (requires sudo)')
 
     args = parser.parse_args()
 
     dispatch = {
-        'status': cmd_status,
-        'set':    cmd_set,
-        'auto':   cmd_auto,
-        'curve':  cmd_curve,
-        'watch':  cmd_watch,
+        'status':   cmd_status,
+        'set':      cmd_set,
+        'auto':     cmd_auto,
+        'curve':    cmd_curve,
+        'watch':    cmd_watch,
+        'max':      cmd_max,
+        'max-stop': cmd_max_stop,
     }
     fn = dispatch.get(args.command)
     if fn:

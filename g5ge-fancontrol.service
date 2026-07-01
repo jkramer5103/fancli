@@ -3,6 +3,7 @@ Description=G5 GE Fan Control Daemon
 
 [Service]
 Type=simple
+User=root
 ExecStart=/usr/local/bin/g5ge-fandaemon.py
 Restart=always
 RestartSec=5
